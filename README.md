@@ -42,14 +42,14 @@ Versions from my environment:
 
 Evaluate a SystemVerilog expression.
 
-Basic command syntax:
+**Basic command syntax**:
 
     $ hw eval <FILE> <EXPRESSION>
 
 - `<FILE>`: file necessary to include for evaluation.
 - `<EXPRESSION>`: SystemVerilog expression to evaluate and display.
 
-Example:
+**Example**:
 
     $ cat >FullAdder.sv <<'EOF'
     function bit [1:0] full_adder(bit a, bit b, bit cin);
@@ -66,14 +66,14 @@ Example:
 
 Simulate a SystemVerilog module.
 
-Basic command syntax:
+**Basic command syntax**:
 
     $ hw sim <FILE>
 
 - `<FILE>`: file containing module to simulate. Name of the file must be the
   same as the module name.
 
-Example:
+**Example**:
 
     $ cat >FullAdder.sv <<'EOF'
     function bit [1:0] full_adder(bit a, bit b, bit cin);
@@ -132,7 +132,7 @@ Example:
 
 Synthesize a SystemVerilog function or module.
 
-Basic command syntax:
+**Basic command syntax**:
 
     $ hw synth <FILE> <TOP>
 
@@ -141,7 +141,7 @@ Basic command syntax:
   character is lowercase, a function is assumed and will be wrapped in a simple
   module.
 
-Example:
+**Example**:
 
     $ cat >FullAdder.sv <<'EOF'
     function bit [1:0] full_adder(bit a, bit b, bit cin);
@@ -180,4 +180,3 @@ Example:
                       Total       9               nan                  8.512
 
     Synthesis complete
-
