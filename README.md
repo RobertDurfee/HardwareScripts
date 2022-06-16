@@ -8,7 +8,7 @@ script for [Minispec](https://github.com/minispec-hdl/minispec).
 
 The `hw` script is a Python script that requires no building or configuration.
 
-An example installation sequence might look like:
+**An example installation sequence might look like**:
 
     $ git clone https://github.com/RobertDurfee/HardwareScripts
     $ mv HardwareScripts /opt/hw
