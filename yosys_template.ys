@@ -1,0 +1,17 @@
+read_verilog -sv $VERILOG_FILE
+
+hierarchy -top $MODULE
+proc; opt -full
+flatten; opt -full
+fsm; opt -full
+memory; opt -full
+techmap; opt -full
+
+dfflibmap -liberty $LIBRARY_FILE
+abc -liberty $LIBRARY_FILE -constr $CONSTRAINTS_FILE -D $DELAY -dff -clk $CLOCK -script $OUT_DIR/abc.script
+
+stat
+
+write_verilog $OUT_DIR/out.verilog
+
+clean

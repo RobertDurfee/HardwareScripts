@@ -1,0 +1,546 @@
+#!/usr/bin/python3
+
+
+from typing import List, Tuple, Any
+import argparse
+import sys
+import os
+import string
+from pathlib import Path
+from tempfile import mkdtemp
+from argparse import Namespace
+from subprocess import Popen, PIPE
+import re
+
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(sys.argv[0]))
+
+
+def get_args() -> Namespace:
+    parser = argparse.ArgumentParser(
+        description='Script for quick-and-dirty evaluating, simulating, and ' +
+                    'synthesizing of hardware.')
+
+    subparsers = parser.add_subparsers(
+        dest='cmd',
+        required=True)
+    eval_parser = subparsers.add_parser(
+        'eval',
+        help='Evaluate an expression.')
+    sim_parser = subparsers.add_parser(
+        'sim',
+        help='Simulate a module.')
+    synth_parser = subparsers.add_parser(
+        'synth',
+        help='Synthesize a function or module.')
+
+    eval_parser.add_argument(
+        'files',
+        type=str,
+        nargs='+',
+        help='Files to include.')
+    eval_parser.add_argument(
+        'expression',
+        type=str,
+        help='Expression to evaluate.')
+    eval_parser.add_argument(
+        '--format', '-f',
+        type=str,
+        default='%d',
+        help='Display format specifier. (Default: %d)')
+
+    sim_parser.add_argument(
+        'file',
+        type=str,
+        help='File with module to simulate.')
+    sim_parser.add_argument(
+        '--clock', '-c',
+        type=str,
+        default='clk',
+        help='Top-level clock signal. (Default: clk)')
+
+    synth_parser.add_argument(
+        'file',
+        type=str,
+        help='File to include.')
+    synth_parser.add_argument(
+        'top',
+        type=str,
+        help='Name of top-level function or module to synthesize.')
+    synth_parser.add_argument(
+        '--library', '-l',
+        type=str,
+        default='multisize',
+        help='Cell library. basic, extended, or multisize. ' +
+             '(Default: multisize)')
+    synth_parser.add_argument(
+        '--delay', '-d',
+        type=int,
+        default=1,
+        help='Target delay in ps. (Default: 1)')
+    synth_parser.add_argument(
+        '--clock', '-c',
+        type=str,
+        default='clk',
+        help='Top-level clock signal. (Default: clk)')
+    synth_parser.add_argument(
+        '--opt', '-O',
+        type=int,
+        default=1,
+        help='Optimization level. (Default: 1)')
+
+    return parser.parse_args()
+
+
+def read_file(file: str) -> str:
+    try:
+        f = open(file, 'r')
+        data = f.read()
+        f.close()
+    except BaseException:
+        print(f"Could not read file {file}")
+        sys.exit(1)
+    return data
+
+
+def write_file(file: str, data: str) -> None:
+    try:
+        f = open(file, "w")
+        f.write(data)
+        f.close()
+    except BaseException:
+        print(f"Could not write file {file}")
+        sys.exit(1)
+
+
+def run_start(cmd: str) -> Popen:
+    return Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+
+
+def run_finish(proc: Popen) -> str:
+    (stdout, stderr) = proc.communicate()
+    if proc.returncode == 0:
+        return stdout.decode('utf-8')
+    else:
+        sys.stderr.write(stderr.decode('utf-8'))
+        sys.stderr.flush()
+        sys.exit(proc.returncode)
+
+
+def run(cmd: str) -> str:
+    proc = run_start(cmd)
+    return run_finish(proc)
+
+
+class Template(string.Template):
+    delimiter = '#'
+
+
+EVAL_TEMPLATE = Template(
+    read_file(os.path.join(SCRIPT_DIR, 'eval_template.sv')))
+
+
+def evaluate(files: List[str], expression: str, args: Namespace) -> None:
+    eval_dir = mkdtemp()
+
+    eval_file = os.path.join(eval_dir, 'Eval.sv')
+    includes = '\n'.join([
+        f'`include "{os.path.abspath(file)}"' for file in files
+    ])
+    eval_data = EVAL_TEMPLATE.substitute(
+        INCLUDES=includes,
+        EXPRESSION=expression,
+        FORMAT=args.format
+    )
+    write_file(eval_file, eval_data)
+
+    simulate(eval_file, Namespace(clock='clk'))
+
+
+SIM_TEMPLATE = string.Template(
+    read_file(os.path.join(SCRIPT_DIR, 'sim_template.cpp')))
+
+VERILATOR_TEMPLATE = string.Template(
+    'verilator --cc --exe --build $SIM_FILE $FILE --Mdir $BUILD_DIR ' +
+    '--relative-includes')
+
+FINISH_PATTERN = re.compile(r"- [^:]+:\d+: Verilog \$finish")
+
+
+def simulate(file: str, args: Namespace) -> None:
+    sim_dir = mkdtemp()
+
+    sim_file = os.path.join(sim_dir, 'sim.cpp')
+    module = Path(file).stem
+    sim_data = SIM_TEMPLATE.substitute(
+        MODULE=module,
+        CLOCK=args.clock
+    )
+    write_file(sim_file, sim_data)
+
+    build_dir = os.path.join(sim_dir, 'build')
+    verilator_cmd = VERILATOR_TEMPLATE.substitute(
+        SIM_FILE=sim_file,
+        FILE=file,
+        BUILD_DIR=build_dir
+    )
+    run(verilator_cmd)
+
+    bin_file = os.path.join(build_dir, f"V{module}")
+    stdout = run(bin_file)
+    for line in stdout.splitlines():
+        if FINISH_PATTERN.match(line) is not None:
+            continue
+        print(line)
+
+
+SYNTH_TEMPLATE = Template(
+    read_file(os.path.join(SCRIPT_DIR, 'synth_template.sv')))
+
+FUNCTION_PATTERN_TEMPLATE = \
+    r"function\s+(?P<output_type>.*?)\s+{function_name}\s*\((?P<inputs>.*?)\);"
+
+
+def strip_comments(source: str) -> str:
+    stripped_multi = re.sub(r"\/\*(.*?)\*\/", '', source,
+                            flags=re.MULTILINE | re.DOTALL)
+    stripped_single = re.sub(r"\/\/(.*?)\n", '\n', stripped_multi)
+    return stripped_single
+
+
+def parse_function(file: str, function_name: str) -> Tuple[str, str, str]:
+    source = strip_comments(read_file(file)).replace('\n', ' ')
+
+    function_pattern = re.compile(FUNCTION_PATTERN_TEMPLATE.format(
+        function_name=function_name))
+
+    match = function_pattern.search(source)
+    if match is None:
+        print(f"Unable to find function '{function_name}' in '{file}'")
+        sys.exit(1)
+
+    output_type = match.group('output_type')
+
+    inputs = match.group('inputs')
+    inputs = inputs.split(',')
+    if inputs[-1] == '':
+        inputs = inputs[:-1]
+
+    args = ', '.join([i.split()[-1] for i in inputs])
+    function_call = f"{function_name}({args})"
+
+    return ',\n'.join(inputs), output_type, function_call
+
+
+YOSYS_TEMPLATE = string.Template(
+    read_file(os.path.join(SCRIPT_DIR, 'yosys_template.ys')))
+
+ABC_TEMPLATE = string.Template(
+    'strash;$OPT;ifraig;map -D $DELAY -B 0.1;cleanup;$BUF;' +
+    'upsize -D $DELAY;dnsize -D $DELAY;stime -p;')
+
+RESYN = 'balance;rewrite;rewrite -z;balance;rewrite -z;balance'
+RESYN2 = 'balance;rewrite;refactor;balance;rewrite;rewrite -z;balance;' + \
+         'refactor -z;rewrite -z;balance'
+
+OPT = {
+    0: [
+        ('ox', 'balance -x'),
+    ],
+    1: [
+        ('ox', 'balance -x'),
+        ('ob', f"{RESYN};if -x;{RESYN2};if -x;balance -x;{RESYN2}"),
+    ],
+}
+
+BUF = [
+    ('nb', ''),
+    ('b', 'buffer'),
+    ('b50', 'buffer -N 50'),
+]
+
+ABC_WIRE_LOAD_PATTERN = re.compile(
+    r"ABC: WireLoad = \"none\" (?P<summary>.*)")
+DELAY_PATTERN = re.compile(
+    r"Delay = (?P<delay>.*?) ps")
+AREA_PATTERN = re.compile(
+    r"Area = (?P<area>.*?) \(")
+ABC_PATH_PATTERN = re.compile(
+    r"ABC:\s?Path\s*\d+\s?--\s+\d+\s?:\s?\d+\s+(?P<fanout>\d+)\s+" +
+    r"(?P<gate_name>\S+).*?Df =(?P<delay>.*?)ps.*")
+ABC_POINT_PATTERN = re.compile(
+    r"ABC: Start-point = .*? \((?P<start_point>.*?)\)\.  " +
+    r"End-point = .*? \((?P<end_point>.*?)\)\.")
+CELL_NAME_PATTERN = re.compile(
+    r"\s*cell\s*\((?P<cell_name>.*?)\)\s*{")
+CELL_AREA_PATTERN = re.compile(
+    r"\s*area\s*:\s*(?P<cell_area>.*?);")
+NUMBER_CELLS_PATTERN = re.compile(
+    r"\s*Number of cells:\s*\d+")
+CELLS_PATTERN = re.compile(
+    r"\s*(?P<cell_name>.*?)\s+(?P<cell_count>.*)")
+
+
+def synthesize(file: str, top: str, args: Namespace) -> None:
+    is_module = top[0].isupper()
+
+    print(f"Synthesizing {'module' if is_module else 'function'} {top} with " +
+          f"library = {args.library}, O{args.opt}, target delay = " +
+          f"{args.delay} ps\n")
+
+    synth_dir = mkdtemp()
+
+    if is_module:
+        module = Path(file).stem
+    else:
+        module = 'Synth'
+        synth_file = os.path.join(synth_dir, f"{module}.sv")
+        includes = f'`include "{os.path.abspath(file)}"'
+        inputs, output_type, function_call = parse_function(file, top)
+        synth_data = SYNTH_TEMPLATE.substitute(
+            INCLUDES=includes,
+            INPUTS=inputs,
+            OUTPUT_TYPE=output_type,
+            FUNCTION_CALL=function_call
+        )
+        write_file(synth_file, synth_data)
+
+        file = synth_file
+
+    verilog_file = os.path.join(synth_dir, f"{module}.v")
+    verilog_data = run(f"sv2v {file}")
+    verilog_data = '\n'.join([
+        line
+        for line in verilog_data.splitlines()
+        if '$finish' not in line and '$display' not in line
+    ])
+    write_file(verilog_file, verilog_data)
+
+    library_file = os.path.join(SCRIPT_DIR, f"{args.library}.lib")
+    size = 'single' if args.library in ['basic', 'extended'] else 'multi'
+    constraints_file = os.path.join(SCRIPT_DIR, f"{size}size.constr")
+
+    def start(out_dir: str, opt: str, buf: str) -> Popen:
+        abc_file = os.path.join(out_dir, 'abc.script')
+        abc_data = ABC_TEMPLATE.substitute(
+            OPT=opt,
+            DELAY=args.delay,
+            BUF=buf
+        )
+        abc_data = '\n'.join([
+            f"echo + {cmd}\n{cmd}" for cmd in abc_data.split(';')
+        ])
+        write_file(abc_file, abc_data)
+
+        yosys_file = os.path.join(out_dir, 'yosys.ys')
+        yosys_data = YOSYS_TEMPLATE.substitute(
+            VERILOG_FILE=verilog_file,
+            MODULE=module,
+            LIBRARY_FILE=library_file,
+            CONSTRAINTS_FILE=constraints_file,
+            DELAY=args.delay,
+            CLOCK=args.clock,
+            OUT_DIR=out_dir
+        )
+        write_file(yosys_file, yosys_data)
+
+        yosys_out = os.path.join(out_dir, 'yosys.out')
+        return run_start(f"yosys {yosys_file} | tee {yosys_out}")
+
+    def finish(out_dir: str, proc: Popen) -> Tuple[float, float]:
+        yosys_out = run_finish(proc)
+
+        summary = None
+        for line in yosys_out.splitlines():
+            match = ABC_WIRE_LOAD_PATTERN.match(line)
+            if match is not None:
+                summary = match.group('summary')
+                break
+
+        if summary is None:
+            print('Yosys output does not contain timing and area analysis')
+            sys.exit(1)
+
+        match = DELAY_PATTERN.search(summary)
+        if match is None:
+            print('Yosys output does not contain timing analysis')
+            sys.exit(1)
+        delay = float(match.group('delay').strip())
+
+        match = AREA_PATTERN.search(summary)
+        if match is None:
+            print('Yosys output does not contain area analysis')
+            sys.exit(1)
+        area = float(match.group('area').strip())
+
+        return delay, area
+
+    procs = []
+    for opt_abbr, opt in OPT[args.opt]:
+        for buf_abbr, buf in BUF:
+            out_dir = os.path.join(synth_dir, f"{opt_abbr}_{buf_abbr}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            proc = start(out_dir, opt, buf)
+            procs.append((out_dir, proc))
+
+    results = []
+    for out_dir, proc in procs:
+        delay, area = finish(out_dir, proc)
+        results.append((delay, area, out_dir))
+
+    results.sort()
+
+    if results[0][0] == 0. and results[0][1] == 0.:
+        print('Synthesized circuit has no logic.')
+        sys.exit(0)
+
+    if results[0][0] >= args.delay:
+        delay, _, out_dir = results[0]
+    else:
+        results = sorted([
+            (area, delay, out_dir)
+            for delay, area, out_dir in results
+            if delay <= args.delay
+        ])
+        _, delay, out_dir = results[0]
+
+    yosys_out = read_file(os.path.join(out_dir, 'yosys.out'))
+
+    cell_areas = {}
+    cell_name = None
+    with open(library_file, 'r') as f:
+        for line in f:
+            match = CELL_NAME_PATTERN.match(line)
+            if match is not None:
+                assert cell_name is None
+                cell_name = match.group('cell_name')
+                continue
+
+            match = CELL_AREA_PATTERN.match(line)
+            if match is not None:
+                assert cell_name is not None
+                cell_area = float(match.group('cell_area'))
+                cell_areas[cell_name] = cell_area
+                cell_name = None
+
+    stats_region = False
+    total_gate_area = 0.
+    total_cells = 0
+    cell_stats = []
+    for line in yosys_out.splitlines():
+        match = NUMBER_CELLS_PATTERN.match(line)
+        if match is not None:
+            stats_region = True
+            continue
+
+        if stats_region:
+            match = CELLS_PATTERN.match(line)
+            if match is None:
+                break
+            cell_name = match.group('cell_name')
+            cell_count = int(match.group('cell_count'))
+            cell_area = cell_areas.get(cell_name, 0.)
+            type_area = cell_area * cell_count
+            total_gate_area += type_area
+            total_cells += cell_count
+            cell_stats.append((cell_name, cell_count, cell_area, type_area))
+
+    # TODO(rbd): Calculate BRAM area
+
+    cum_delay = 0.
+    path_lines = []
+    start_point, end_point = None, None
+    for line in yosys_out.splitlines():
+        match = ABC_PATH_PATTERN.match(line)
+        if match is not None:
+            fanout = int(match.group('fanout'))
+            gate_name = match.group('gate_name')
+            new_cum_delay = float(match.group('delay').strip().split()[0])
+
+            t_pd = new_cum_delay - cum_delay
+            cum_delay = new_cum_delay
+
+            path_lines.append((gate_name, fanout, t_pd, cum_delay))
+
+            continue
+
+        match = ABC_POINT_PATTERN.match(line)
+        if match is not None:
+            start_point = match.group('start_point').strip()
+            end_point = match.group('end_point').strip()
+
+            if len(path_lines) == 0:
+                print('Missing path.')
+                sys.exit(1)
+
+            path_lines[0] = ('IN',) + path_lines[0][1:]
+
+            break
+
+    if start_point is None or end_point is None:
+        print('Missing start/end point.')
+        sys.exit(1)
+
+    path_lines.append(('OUT', 0, 0., cum_delay))
+
+    print(f"Gates: {total_cells}")
+    print(f"Area: {total_gate_area:.2f} um^2")
+    print(f"Critical-path delay: {delay} ps")
+
+    def print_columns(header: List[Tuple[str, ...]],
+                      rows: List[Tuple[Any, ...]]) -> None:
+        lines = header[:2]
+        fmt = header[2]
+
+        for row in rows:
+            lines.append(
+                tuple(fmt[i].format(elem) for i, elem in enumerate(row)))
+
+        widths = [0] * len(fmt)
+
+        for line in lines:
+            for i, elem in enumerate(line):
+                widths[i] = max(widths[i], len(elem))
+
+        for line in lines:
+            print(' '.join([
+                f"{elem: >{widths[i]}}" for i, elem in enumerate(line)
+            ]))
+
+    def print_path(path_lines) -> None:
+        print_columns([
+            ('              Gate/port', ' Fanout', '  Gate delay (ps)', ' Cumulative delay (ps)'),  # noqa
+            ('              ---------', ' ------', '  ---------------', ' ---------------------'),  # noqa
+            ('              {}',        ' {}',     '  {:.1f}',          ' {:.1f}'),  # noqa
+        ], path_lines)
+
+    def print_area(area) -> None:
+        print_columns([
+            ('              Gate type', '  Gates', ' Area/gate (um^2)', '      Area/type (um^2)'),  # noqa
+            ('              ---------', '  -----', ' ----------------', '      ----------------'),  # noqa
+            ('              {}',        '  {}',    ' {:.3f}',           '      {:.3f}'),  # noqa
+        ], area + [
+            ('Total', total_cells, float('nan'), total_gate_area)
+        ])
+
+    print(f"\nCritical path: {start_point} -> {end_point}\n")
+    print_path(path_lines)
+
+    print('\nArea breakdown:\n')
+    print_area(cell_stats)
+
+    print('\nSynthesis complete')
+
+
+if __name__ == "__main__":
+    args = get_args()
+
+    if args.cmd == 'eval':
+        evaluate(args.files, args.expression, args)
+    elif args.cmd == 'sim':
+        simulate(args.file, args)
+    elif args.cmd == 'synth':
+        synthesize(args.file, args.top, args)
+    else:
+        assert False, 'unreachable'
