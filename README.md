@@ -15,7 +15,7 @@ An example installation sequence might look like:
     $ echo 'export PATH:/opt/hw:$PATH' >>~/.zshrc
     $ source ~/.zshrc
 
-Dependencies:
+**Dependencies**:
 
 - [`python3`](https://www.python.org/downloads/) interpreter with typing
   support.
@@ -25,7 +25,7 @@ Dependencies:
   conversion for synthesis.
 - [`yosys`](https://github.com/YosysHQ/yosys) for synthesis.
 
-Versions from my environment:
+**Versions from my environment**:
 
     $ python3 --version
     Python 3.9.13
