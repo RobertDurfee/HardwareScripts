@@ -21,6 +21,12 @@ def get_args() -> Namespace:
         description='Script for quick-and-dirty evaluating, simulating, and ' +
                     'synthesizing of hardware.')
 
+    parser.add_argument(
+        '--verbose', '-v',
+        default=False,
+        action='store_true',
+        help='Print additional information.')
+
     subparsers = parser.add_subparsers(
         dest='cmd',
         required=True)
@@ -143,6 +149,9 @@ EVAL_TEMPLATE = Template(
 def evaluate(files: List[str], expression: str, args: Namespace) -> None:
     eval_dir = mkdtemp()
 
+    if args.verbose:
+        print(f"Evaluate directory: {eval_dir}\n")
+
     eval_file = os.path.join(eval_dir, 'Eval.sv')
     includes = '\n'.join([
         f'`include "{os.path.abspath(file)}"' for file in files
@@ -169,6 +178,9 @@ FINISH_PATTERN = re.compile(r"- [^:]+:\d+: Verilog \$finish")
 
 def simulate(file: str, args: Namespace) -> None:
     sim_dir = mkdtemp()
+
+    if args.verbose:
+        print(f"Simulation directory: {sim_dir}\n")
 
     sim_file = os.path.join(sim_dir, 'sim.cpp')
     module = Path(file).stem
@@ -299,6 +311,9 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
           f"{args.delay} ps\n")
 
     synth_dir = mkdtemp()
+
+    if args.verbose:
+        print(f"Synthesis directory: {synth_dir}\n")
 
     if is_module:
         module = Path(file).stem
