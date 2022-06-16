@@ -85,6 +85,7 @@ Example:
     EOF
     $ cat >FullAdderTest.sv <<'EOF'
     `include "FullAdder.sv"
+
     module FullAdderTest(
       input bit clk
     );
@@ -97,9 +98,11 @@ Example:
         bit [1:0] actual = full_adder(x[2], x[1], x[0]);
 
         if (expected == actual) begin
-          $display("full_adder(%d, %d, %d) = %d", x[2], x[1], x[0], actual);
+          $display("full_adder(%d, %d, %d) = %d",
+                   x[2], x[1], x[0], actual);
         end else begin
-          $display("full_adder(%d, %d, %d) = %d (ERROR: expected %d)", x[2], x[1], x[0], actual, expected);
+          $display("full_adder(%d, %d, %d) = %d (ERROR: expected %d)",
+                   x[2], x[1], x[0], actual, expected);
           failed <= 1;
         end
 
