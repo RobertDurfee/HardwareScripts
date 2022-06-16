@@ -197,8 +197,11 @@ def simulate(file: str, args: Namespace) -> None:
 SYNTH_TEMPLATE = Template(
     read_file(os.path.join(SCRIPT_DIR, 'synth_template.sv')))
 
-FUNCTION_PATTERN_TEMPLATE = \
-    r"function\s+(?P<output_type>.*?)\s+{function_name}\s*\((?P<inputs>.*?)\);"
+FUNCTION_PATTERN = re.compile(
+    r" function (?P<function_signature>.*?);")
+
+FUNCTION_SIGNATURE_PATTERN = re.compile(
+    r"\s*(?P<output_type>.*?)\s+(?P<function_name>\w+)\s*\((?P<inputs>.*?)\)")
 
 
 def strip_comments(source: str) -> str:
@@ -209,12 +212,19 @@ def strip_comments(source: str) -> str:
 
 
 def parse_function(file: str, function_name: str) -> Tuple[str, str, str]:
-    source = strip_comments(read_file(file)).replace('\n', ' ')
+    source = ' ' + strip_comments(read_file(file)).replace('\n', ' ')
 
-    function_pattern = re.compile(FUNCTION_PATTERN_TEMPLATE.format(
-        function_name=function_name))
+    match = None
+    for function in FUNCTION_PATTERN.finditer(source):
+        function_signature = function.group('function_signature')
 
-    match = function_pattern.search(source)
+        match = FUNCTION_SIGNATURE_PATTERN.search(function_signature)
+        if match is not None:
+            if function_name == match.group('function_name'):
+                break
+            else:
+                match = None
+
     if match is None:
         print(f"Unable to find function '{function_name}' in '{file}'")
         sys.exit(1)
