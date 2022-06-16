@@ -163,7 +163,7 @@ def evaluate(files: List[str], expression: str, args: Namespace) -> None:
     )
     write_file(eval_file, eval_data)
 
-    simulate(eval_file, Namespace(clock='clk'))
+    simulate(eval_file, Namespace(clock='clk', **vars(args)))
 
 
 SIM_TEMPLATE = string.Template(
