@@ -11,9 +11,7 @@ from tempfile import mkdtemp
 from argparse import Namespace
 from subprocess import Popen, PIPE
 import re
-
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(sys.argv[0]))
+from common import SCRIPT_DIR, read_file
 
 
 def get_args() -> Namespace:
@@ -96,17 +94,6 @@ def get_args() -> Namespace:
         help='Optimization level. (Default: 1)')
 
     return parser.parse_args()
-
-
-def read_file(file: str) -> str:
-    try:
-        f = open(file, 'r')
-        data = f.read()
-        f.close()
-    except BaseException:
-        print(f"Could not read file {file}")
-        sys.exit(1)
-    return data
 
 
 def write_file(file: str, data: str) -> None:
@@ -558,7 +545,7 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
     print('\nSynthesis complete')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     args = get_args()
 
     if args.cmd == 'eval':

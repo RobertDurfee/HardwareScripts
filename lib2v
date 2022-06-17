@@ -1,0 +1,151 @@
+#!/usr/bin/python3
+
+
+import argparse
+from argparse import Namespace
+from common import SCRIPT_DIR, read_file
+import re
+from typing import List
+import string
+import os
+import sys
+
+
+def get_args() -> Namespace:
+    parser = argparse.ArgumentParser(
+        description='Script for converting standard cell Liberty file to ' +
+                    'Verilog to include for simulation.')
+
+    parser.add_argument(
+        'file',
+        type=str,
+        help='Liberty file to parse.')
+
+    return parser.parse_args()
+
+
+CELL_NAME_PATTERN = re.compile(
+    r"\s*cell\s*\((?P<cell_name>.*?)\)\s*{")
+
+FF_PATTERN = re.compile(
+    r"\s*ff\s*\(\"(?P<variable_1>.*?)\"\s*,\s*\"(?P<variable_2>.*?)\"\)\s*{")
+
+NEXT_STATE_PATTERN = re.compile(
+    r"\s*next_state\s*:\s*\"(?P<next_state>.*?)\";")
+
+CLOCKED_ON_PATTERN = re.compile(
+    r"\s*clocked_on\s*:\s*\"(?P<clocked_on>.*?)\";")
+
+PIN_NAME_PATTERN = re.compile(
+    r"\s*pin\s*\((?P<pin_name>.*?)\)\s*{")
+
+DIRECTION_PATTERN = re.compile(
+    r"\s*direction\s*:\s*(?P<direction>.*?);")
+
+OUTPUT_FUNCTION_PATTERN = re.compile(
+    r"\s*function\s*:\s*\"(?P<output_function>.*?)\";")
+
+COMB_CELL_MODULE_TEMPLATE = string.Template(
+    read_file(os.path.join(SCRIPT_DIR, 'comb_cell_module_template.v')))
+
+FF_CELL_MODULE_TEMPLATE = string.Template(
+    read_file(os.path.join(SCRIPT_DIR, 'ff_cell_module_template.v')))
+
+
+def lib2v(file: str) -> None:
+    liberty_data = read_file(file)
+
+    print('/* verilator lint_off MULTITOP */')
+    print('/* verilator lint_off DECLFILENAME */\n')
+
+    cell_name = None
+    variable_1, variable_2 = None, None
+    next_state = None
+    clocked_on = None
+    pin_name = None
+    inputs: List[str] = []
+    outputs: List[str] = []
+    output_functions: List[str] = []
+    for line in liberty_data.splitlines():
+        match = CELL_NAME_PATTERN.match(line)
+        if match is not None:
+            if cell_name is not None:
+                inputs = [f"input wire {input}" for input in inputs]
+                output_functions = [
+                    f"assign {output} = {function}"
+                    for output, function in zip(outputs, output_functions)
+                ]
+                outputs = [f"output wire {output}" for output in outputs]
+
+                if variable_1 is not None:
+                    print(FF_CELL_MODULE_TEMPLATE.substitute(
+                        CELL_NAME=cell_name,
+                        INPUTS=',\n  '.join(inputs),
+                        OUTPUTS=',\n  '.join(outputs),
+                        VARIABLE_1=variable_1,
+                        VARIABLE_2=variable_2,
+                        OUTPUT_FUNCTIONS=';\n  '.join(output_functions),
+                        CLOCKED_ON=clocked_on,
+                        NEXT_STATE=next_state
+                    ))
+                else:
+                    print(COMB_CELL_MODULE_TEMPLATE.substitute(
+                        CELL_NAME=cell_name,
+                        INPUTS=',\n  '.join(inputs),
+                        OUTPUTS=',\n  '.join(outputs),
+                        OUTPUT_FUNCTIONS=';\n  '.join(output_functions)
+                    ))
+
+                cell_name = None
+                variable_1, variable_2 = None, None
+                next_state = None
+                clocked_on = None
+                pin_name = None
+                inputs = []
+                outputs = []
+                output_functions = []
+
+            cell_name = match.group('cell_name')
+            continue
+
+        match = FF_PATTERN.match(line)
+        if match is not None:
+            variable_1 = match.group('variable_1')
+            variable_2 = match.group('variable_2')
+            continue
+
+        match = NEXT_STATE_PATTERN.match(line)
+        if match is not None:
+            next_state = match.group('next_state')
+            continue
+
+        match = CLOCKED_ON_PATTERN.match(line)
+        if match is not None:
+            clocked_on = match.group('clocked_on')
+            continue
+
+        match = PIN_NAME_PATTERN.match(line)
+        if match is not None:
+            pin_name = match.group('pin_name')
+            continue
+
+        match = DIRECTION_PATTERN.match(line)
+        if match is not None:
+            assert pin_name is not None
+            if match.group('direction') == 'input':
+                inputs.append(pin_name)
+            else:
+                outputs.append(pin_name)
+
+        match = OUTPUT_FUNCTION_PATTERN.match(line)
+        if match is not None:
+            output_function = match.group('output_function')
+            output_functions.append(output_function)
+
+
+if __name__ == '__main__':
+    print(f"/* Generated with `{' '.join(sys.argv)}` */\n")
+
+    args = get_args()
+
+    lib2v(args.file)
