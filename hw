@@ -24,6 +24,11 @@ def get_args() -> Namespace:
         default=False,
         action='store_true',
         help='Print additional information.')
+    parser.add_argument(
+        '--output', '-o',
+        type=str,
+        default=None,
+        help='Output directory. (Default: None)')
 
     subparsers = parser.add_subparsers(
         dest='cmd',
@@ -62,6 +67,22 @@ def get_args() -> Namespace:
         type=str,
         default='clk',
         help='Top-level clock signal. (Default: clk)')
+    sim_parser.add_argument(
+        '--stop', '-s',
+        type=str,
+        default='$finish',
+        help='Stop condition for simulation. $finish, simulation time, or ' +
+             'signal name. (Default: $finish)')
+    sim_parser.add_argument(
+        '--trace', '-t',
+        type=str,
+        default=None,
+        help='Output VCD trace file. (Default: None)')
+    sim_parser.add_argument(
+        '--depth', '-d',
+        type=int,
+        default=99,
+        help='Trace depth. (Default: 99)')
 
     synth_parser.add_argument(
         'file',
@@ -134,7 +155,11 @@ EVAL_TEMPLATE = Template(
 
 
 def evaluate(files: List[str], expression: str, args: Namespace) -> None:
-    eval_dir = mkdtemp()
+    if args.output is None:
+        eval_dir = mkdtemp()
+    else:
+        eval_dir = os.path.abspath(args.output)
+        os.makedirs(eval_dir, exist_ok=True)
 
     if args.verbose:
         print(f"Evaluate directory: {eval_dir}\n")
@@ -156,25 +181,60 @@ def evaluate(files: List[str], expression: str, args: Namespace) -> None:
 SIM_TEMPLATE = string.Template(
     read_file(os.path.join(SCRIPT_DIR, 'sim_template.cpp')))
 
+SIM_TRACE_TEMPLATE = string.Template(
+    read_file(os.path.join(SCRIPT_DIR, 'sim_trace_template.cpp')))
+
+STOP_PATTERN = re.compile(
+    r"(?P<finish>\$finish)|(?P<time>\d+)|(?P<signal>[a-zA-Z_]\w*)")
+
 VERILATOR_TEMPLATE = string.Template(
     'verilator --cc --exe --build $SIM_FILE $FILE --Mdir $BUILD_DIR ' +
-    '--relative-includes')
+    '--relative-includes -CFLAGS -DVL_NO_LEGACY')
 
 FINISH_PATTERN = re.compile(r"- [^:]+:\d+: Verilog \$finish")
 
 
 def simulate(file: str, args: Namespace) -> None:
-    sim_dir = mkdtemp()
+    if args.output is None:
+        sim_dir = mkdtemp()
+    else:
+        sim_dir = os.path.abspath(args.output)
+        os.makedirs(sim_dir, exist_ok=True)
 
     if args.verbose:
         print(f"Simulation directory: {sim_dir}\n")
 
+    match = STOP_PATTERN.match(args.stop)
+    if match is None:
+        print(f"Invalid stop condition `{args.stop}`")
+        sys.exit(1)
+
+    stop_type = match.lastgroup
+    if stop_type == 'finish':
+        stop = '!context->gotFinish()'
+    elif stop_type == 'time':
+        stop = f"context->time() < {match.group('time')}"
+    elif stop_type == 'signal':
+        stop = f"!top->{match.group('signal')}"
+    else:
+        assert False, 'unreachable'
+
     sim_file = os.path.join(sim_dir, 'sim.cpp')
     module = Path(file).stem
-    sim_data = SIM_TEMPLATE.substitute(
-        MODULE=module,
-        CLOCK=args.clock
-    )
+    if args.trace is None:
+        sim_data = SIM_TEMPLATE.substitute(
+            MODULE=module,
+            STOP=stop,
+            CLOCK=args.clock
+        )
+    else:
+        sim_data = SIM_TRACE_TEMPLATE.substitute(
+            MODULE=module,
+            DEPTH=args.depth,
+            TRACE=args.trace,
+            STOP=stop,
+            CLOCK=args.clock
+        )
     write_file(sim_file, sim_data)
 
     build_dir = os.path.join(sim_dir, 'build')
@@ -182,7 +242,7 @@ def simulate(file: str, args: Namespace) -> None:
         SIM_FILE=sim_file,
         FILE=file,
         BUILD_DIR=build_dir
-    )
+    ) + (' --trace' if args.trace is not None else '')
     run(verilator_cmd)
 
     bin_file = os.path.join(build_dir, f"V{module}")
@@ -297,10 +357,14 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
           f"library = {args.library}, O{args.opt}, target delay = " +
           f"{args.delay} ps\n")
 
-    synth_dir = mkdtemp()
+    if args.output is None:
+        synth_dir = mkdtemp()
+    else:
+        synth_dir = os.path.abspath(args.output)
+        os.makedirs(synth_dir, exist_ok=True)
 
     if args.verbose:
-        print(f"Synthesis directory: {synth_dir}\n")
+        print(f"Synthesis directory: {synth_dir}")
 
     if is_module:
         module = Path(file).stem
@@ -323,8 +387,9 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
     verilog_data = run(f"sv2v {file}")
     verilog_data = '\n'.join([
         line
-        for line in verilog_data.splitlines()
         if '$finish' not in line and '$display' not in line
+        else f"/*{line}*/;"
+        for line in verilog_data.splitlines()
     ])
     write_file(verilog_file, verilog_data)
 
@@ -416,6 +481,20 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
             if delay <= args.delay
         ])
         _, delay, out_dir = results[0]
+
+    if args.verbose:
+        print(f"Best result directory: {out_dir}\n")
+
+    library_cells_file = os.path.join(SCRIPT_DIR, f"{args.library}_cells.v")
+    verilog_file = os.path.join(synth_dir, 'out.v')
+    verilog_data = read_file(os.path.join(out_dir, 'out.v'))
+    verilog_lines = verilog_data.splitlines()
+    verilog_lines = \
+        verilog_lines[:1] + \
+        [f'`include "{library_cells_file}"'] + \
+        verilog_lines[1:]
+    verilog_data = '\n'.join(verilog_lines)
+    write_file(verilog_file, verilog_data)
 
     yosys_out = read_file(os.path.join(out_dir, 'yosys.out'))
 
