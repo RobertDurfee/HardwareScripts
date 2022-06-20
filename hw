@@ -482,6 +482,8 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
         ])
         _, delay, out_dir = results[0]
 
+    os.symlink(out_dir, os.path.join(synth_dir, 'best'))
+
     if args.verbose:
         print(f"Best result directory: {out_dir}\n")
 
