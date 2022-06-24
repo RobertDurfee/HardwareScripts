@@ -1,12 +1,9 @@
 #INCLUDES
 
-module Eval(
-  input bit clk
-);
+module Eval;
 
-  always_ff @(posedge clk) begin
+  always_comb begin
     $display("#EXPRESSION = #FORMAT", #EXPRESSION);
-    $finish;
   end
 
 endmodule

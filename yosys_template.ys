@@ -12,8 +12,6 @@ abc -liberty $LIBRARY_FILE -constr $CONSTRAINTS_FILE -D $DELAY -dff -clk $CLOCK 
 
 stat
 
-write_blif $OUT_DIR/out.blif
-
-write_verilog $OUT_DIR/out.v
+write_verilog -norename $OUT_DIR/out.v
 
 clean

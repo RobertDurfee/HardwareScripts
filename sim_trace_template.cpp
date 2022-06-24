@@ -13,11 +13,12 @@ int main(int argc, char **argv, char **env) {
   top->trace(trace, $DEPTH);
   trace->open("$TRACE");
 
-  while ($STOP) {
-    context->timeInc(1);
-    top->$CLOCK = ~top->$CLOCK;
+  while (context->time() < 6 || ($STOP)) {
+    top->$RESET = (3 <= context->time() && context->time() < 6);
+    top->$CLOCK ^= 1;
     top->eval();
     trace->dump(context->time());
+    context->timeInc(1);
   }
 
   trace->close();

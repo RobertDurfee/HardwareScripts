@@ -7,12 +7,7 @@ int main(int argc, char **argv, char **env) {
 
   V$MODULE *top = new V$MODULE { context };
 
-  while (context->time() < 6 || ($STOP)) {
-    top->$RESET = (3 <= context->time() && context->time() < 6);
-    top->$CLOCK ^= 1;
-    top->eval();
-    context->timeInc(1);
-  }
+  top->eval();
 
   delete top;
   delete context;

@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, NamedTuple, Dict
 import argparse
 import sys
 import os
@@ -16,8 +16,8 @@ from common import SCRIPT_DIR, read_file
 
 def get_args() -> Namespace:
     parser = argparse.ArgumentParser(
-        description='Script for quick-and-dirty evaluating, simulating, and ' +
-                    'synthesizing of hardware.')
+        description='Script for quick-and-dirty evaluating, simulating, ' +
+                    'synthesizing, and power estimation of hardware.')
 
     parser.add_argument(
         '--verbose', '-v',
@@ -42,6 +42,9 @@ def get_args() -> Namespace:
     synth_parser = subparsers.add_parser(
         'synth',
         help='Synthesize a function or module.')
+    power_parser = subparsers.add_parser(
+        'power',
+        help='Estimate (switching) power of a module.')
 
     eval_parser.add_argument(
         'files',
@@ -63,6 +66,11 @@ def get_args() -> Namespace:
         type=str,
         help='File with module to simulate.')
     sim_parser.add_argument(
+        '--reset', '-r',
+        type=str,
+        default='rst',
+        help='Top-level reset signal. (Default: rst)')
+    sim_parser.add_argument(
         '--clock', '-c',
         type=str,
         default='clk',
@@ -78,11 +86,6 @@ def get_args() -> Namespace:
         type=str,
         default=None,
         help='Output VCD trace file. (Default: None)')
-    sim_parser.add_argument(
-        '--depth', '-d',
-        type=int,
-        default=99,
-        help='Trace depth. (Default: 99)')
 
     synth_parser.add_argument(
         'file',
@@ -113,6 +116,66 @@ def get_args() -> Namespace:
         type=int,
         default=1,
         help='Optimization level. (Default: 1)')
+    synth_parser.add_argument(
+        '--yosys', '-y',
+        type=str,
+        default='yosys',
+        help='Yosys binary. (Default: yosys)')
+
+    power_parser.add_argument(
+        'file',
+        type=str,
+        help='File with module to estimate power.')
+    power_parser.add_argument(
+        'top',
+        type=str,
+        help='Name of top-level function or module to estimate power.')
+    power_parser.add_argument(
+        'testbench',
+        type=str,
+        help='File with testbench for simulation.')
+    power_parser.add_argument(
+        '--glitch', '-g',
+        default=False,
+        action='store_true',
+        help='Include glitch power. (Default: False)')
+    power_parser.add_argument(
+        '--reset', '-r',
+        type=str,
+        default='rst',
+        help='Top-level reset signal. (Default: rst)')
+    power_parser.add_argument(
+        '--clock', '-c',
+        type=str,
+        default='clk',
+        help='Top-level clock signal. (Default: clk)')
+    power_parser.add_argument(
+        '--stop', '-s',
+        type=str,
+        default='$finish',
+        help='Stop condition for simulation. $finish, simulation time, or ' +
+             'signal name. (Default: $finish)')
+    power_parser.add_argument(
+        '--library', '-l',
+        type=str,
+        default='multisize',
+        help='Cell library. basic, extended, or multisize. ' +
+             '(Default: multisize)')
+    power_parser.add_argument(
+        '--delay', '-d',
+        type=int,
+        default=1,
+        help='Target delay in ps. (Default: 1)')
+    power_parser.add_argument(
+        '--opt', '-O',
+        type=int,
+        default=1,
+        help='Optimization level. (Default: 1)')
+    power_parser.add_argument(
+        '--yosys', '-y',
+        type=str,
+        default='yosys',
+        help='Yosys binary. (Default: yosys)')
 
     return parser.parse_args()
 
@@ -154,7 +217,7 @@ EVAL_TEMPLATE = Template(
     read_file(os.path.join(SCRIPT_DIR, 'eval_template.sv')))
 
 
-def evaluate(files: List[str], expression: str, args: Namespace) -> None:
+def run_eval(files: List[str], expression: str, args: Namespace) -> None:
     if args.output is None:
         eval_dir = mkdtemp()
     else:
@@ -175,7 +238,13 @@ def evaluate(files: List[str], expression: str, args: Namespace) -> None:
     )
     write_file(eval_file, eval_data)
 
-    simulate(eval_file, Namespace(clock='clk', **vars(args)))
+    run_sim(eval_file, Namespace(
+        reset='rst',
+        clock='clk',
+        stop='$finish',
+        trace=None,
+        **vars(args)),
+        func=True)
 
 
 SIM_TEMPLATE = string.Template(
@@ -184,17 +253,25 @@ SIM_TEMPLATE = string.Template(
 SIM_TRACE_TEMPLATE = string.Template(
     read_file(os.path.join(SCRIPT_DIR, 'sim_trace_template.cpp')))
 
+SIM_FUNC_TEMPLATE = string.Template(
+    read_file(os.path.join(SCRIPT_DIR, 'sim_func_template.cpp')))
+
 STOP_PATTERN = re.compile(
     r"(?P<finish>\$finish)|(?P<time>\d+)|(?P<signal>[a-zA-Z_]\w*)")
 
 VERILATOR_TEMPLATE = string.Template(
     'verilator --cc --exe --build $SIM_FILE $FILE --Mdir $BUILD_DIR ' +
-    '--relative-includes -CFLAGS -DVL_NO_LEGACY')
+    '--relative-includes -CFLAGS -DVL_NO_LEGACY --top-module $MODULE')
 
 FINISH_PATTERN = re.compile(r"- [^:]+:\d+: Verilog \$finish")
 
 
-def simulate(file: str, args: Namespace) -> None:
+def run_sim(file: str, args: Namespace, func: bool = False) -> str:
+    module = Path(file).stem
+
+    if not func:
+        print(f"Simulating module {module}\n")
+
     if args.output is None:
         sim_dir = mkdtemp()
     else:
@@ -220,37 +297,48 @@ def simulate(file: str, args: Namespace) -> None:
         assert False, 'unreachable'
 
     sim_file = os.path.join(sim_dir, 'sim.cpp')
-    module = Path(file).stem
-    if args.trace is None:
-        sim_data = SIM_TEMPLATE.substitute(
-            MODULE=module,
-            STOP=stop,
-            CLOCK=args.clock
+    if func:
+        sim_data = SIM_FUNC_TEMPLATE.substitute(
+            MODULE=module
         )
     else:
-        sim_data = SIM_TRACE_TEMPLATE.substitute(
-            MODULE=module,
-            DEPTH=args.depth,
-            TRACE=args.trace,
-            STOP=stop,
-            CLOCK=args.clock
-        )
+        if args.trace is None:
+            sim_data = SIM_TEMPLATE.substitute(
+                MODULE=module,
+                STOP=stop,
+                RESET=args.reset,
+                CLOCK=args.clock
+            )
+        else:
+            sim_data = SIM_TRACE_TEMPLATE.substitute(
+                MODULE=module,
+                DEPTH=999,
+                TRACE=args.trace,
+                STOP=stop,
+                RESET=args.reset,
+                CLOCK=args.clock
+            )
     write_file(sim_file, sim_data)
 
     build_dir = os.path.join(sim_dir, 'build')
     verilator_cmd = VERILATOR_TEMPLATE.substitute(
         SIM_FILE=sim_file,
         FILE=file,
-        BUILD_DIR=build_dir
-    ) + (' --trace' if args.trace is not None else '')
+        BUILD_DIR=build_dir,
+        MODULE=module
+    ) + (' --trace --trace-underscore' if args.trace is not None else '')
     run(verilator_cmd)
 
-    bin_file = os.path.join(build_dir, f"V{module}")
+    bin_file = os.path.join(build_dir, f"V{module} +verilator+rand+reset+2")
     stdout = run(bin_file)
     for line in stdout.splitlines():
         if FINISH_PATTERN.match(line) is not None:
             continue
         print(line)
+
+    print('\nSimulation complete')
+
+    return stdout
 
 
 SYNTH_TEMPLATE = Template(
@@ -306,7 +394,7 @@ YOSYS_TEMPLATE = string.Template(
 
 ABC_TEMPLATE = string.Template(
     'strash;$OPT;ifraig;map -D $DELAY -B 0.1;cleanup;$BUF;' +
-    'upsize -D $DELAY;dnsize -D $DELAY;stime -p;')
+    'upsize -D $DELAY;dnsize -D $DELAY;stime -p -a;')
 
 RESYN = 'balance;rewrite;rewrite -z;balance;rewrite -z;balance'
 RESYN2 = 'balance;rewrite;refactor;balance;rewrite;rewrite -z;balance;' + \
@@ -336,10 +424,16 @@ AREA_PATTERN = re.compile(
     r"Area = (?P<area>.*?) \(")
 ABC_PATH_PATTERN = re.compile(
     r"ABC:\s?Path\s*\d+\s?--\s+\d+\s?:\s?\d+\s+(?P<fanout>\d+)\s+" +
-    r"(?P<gate_name>\S+).*?Df =(?P<delay>.*?)ps.*")
+    r"(?P<name>\S+).*?Df =(?P<delay>.*?)ps.*")
+ABC_NODE_PATTERN = re.compile(
+    r"ABC:\s*(?P<id>\d+)\s*:\s*(?P<fanin>\d+)\s*(?P<fanout>\d+)\s*" +
+    r"(?P<type>\w+)\s*A\s*=\s*(?P<area>.*?)\s*Dr\s*=\s*(?P<delay_upper>.*?)" +
+    r"\s+(?P<delay_diff>.*?)\s*ps\s*S\s*=\s*(?P<slew_upper>.*?)\s*ps\s*Cin" +
+    r"\s*=\s*.*?\s*ff\s*Cout\s*=\s*(?P<load_upper>.*?)\s*ff\s*Cmax\s*=\s*" +
+    r"(?P<load_max>.*?)\s*ff\s*G\s*=\s*.*")
 ABC_POINT_PATTERN = re.compile(
-    r"ABC: Start-point = .*? \((?P<start_point>.*?)\)\.  " +
-    r"End-point = .*? \((?P<end_point>.*?)\)\.")
+    r"ABC: Start-point = .*? \((?P<crit_start>.*?)\)\.  " +
+    r"End-point = .*? \((?P<crit_end>.*?)\)\.")
 CELL_NAME_PATTERN = re.compile(
     r"\s*cell\s*\((?P<cell_name>.*?)\)\s*{")
 CELL_AREA_PATTERN = re.compile(
@@ -349,8 +443,67 @@ NUMBER_CELLS_PATTERN = re.compile(
 CELLS_PATTERN = re.compile(
     r"\s*(?P<cell_name>.*?)\s+(?P<cell_count>.*)")
 
+PathLine = NamedTuple('PathLine', [
+    ('name', str),
+    ('fanout', int),
+    ('t_pd', float),
+    ('cum_delay', float),
+])
 
-def synthesize(file: str, top: str, args: Namespace) -> None:
+CellStats = NamedTuple('CellStats', [
+    ('cell_name', str),
+    ('cell_count', int),
+    ('cell_area', float),
+    ('type_area', float),
+])
+
+Node = NamedTuple('Node', [
+    ('id', int),
+    ('fanin', int),
+    ('fanout', int),
+    ('type', str),
+    ('area', float),
+    ('delay_upper', float),
+    ('delay_diff', float),
+    ('slew_upper', float),
+    ('load_upper', float),
+    ('load_max', float),
+])
+
+Synthesis = NamedTuple('Synthesis', [
+    ('total_cells', int),
+    ('total_gate_area', float),
+    ('delay', float),
+    ('crit_start', str),
+    ('crit_end', str),
+    ('path_lines', List[PathLine]),
+    ('cell_stats', List[CellStats]),
+    ('nodes', List[Node]),
+])
+
+
+def print_columns(header: List[Tuple[str, ...]],
+                  rows: List[Tuple[Any, ...]]) -> None:
+    lines = header[:2]
+    fmt = header[2]
+
+    for row in rows:
+        lines.append(
+            tuple(fmt[i].format(elem) for i, elem in enumerate(row)))
+
+    widths = [0] * len(fmt)
+
+    for line in lines:
+        for i, elem in enumerate(line):
+            widths[i] = max(widths[i], len(elem))
+
+    for line in lines:
+        print(' '.join([
+            f"{elem: >{widths[i]}}" for i, elem in enumerate(line)
+        ]))
+
+
+def run_synth(file: str, top: str, args: Namespace) -> Synthesis:
     is_module = top[0].isupper()
 
     print(f"Synthesizing {'module' if is_module else 'function'} {top} with " +
@@ -422,7 +575,7 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
         write_file(yosys_file, yosys_data)
 
         yosys_out = os.path.join(out_dir, 'yosys.out')
-        return run_start(f"yosys {yosys_file} | tee {yosys_out}")
+        return run_start(f"{args.yosys} {yosys_file} | tee {yosys_out}")
 
     def finish(out_dir: str, proc: Popen) -> Tuple[float, float]:
         yosys_out = run_finish(proc)
@@ -537,69 +690,78 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
             type_area = cell_area * cell_count
             total_gate_area += type_area
             total_cells += cell_count
-            cell_stats.append((cell_name, cell_count, cell_area, type_area))
+            cell_stats.append(CellStats(cell_name, cell_count, cell_area,
+                                        type_area))
 
-    # TODO(rbd): Calculate BRAM area
+    # TODO(rbd): Calculate BRAM area.
 
+    nodes = []
     cum_delay = 0.
     path_lines = []
-    start_point, end_point = None, None
+    crit_start, crit_end = None, None
     for line in yosys_out.splitlines():
+        match = ABC_NODE_PATTERN.match(line)
+        if match is not None:
+            id = int(match.group('id'))
+            fanin = int(match.group('fanin'))
+            fanout = int(match.group('fanout'))
+            type = match.group('type')
+            area = float(match.group('area'))
+            # delay_rise = float(match.group('delay_rise'))
+            # delay_fall = float(match.group('delay_fall'))
+            delay_upper = float(match.group('delay_upper'))
+            delay_diff = float(match.group('delay_diff'))
+            # slew_rise = float(match.group('slew_rise'))
+            # slew_fall = float(match.group('slew_fall'))
+            slew_upper = float(match.group('slew_upper'))
+            # load_rise = float(match.group('load_rise'))
+            # load_fall = float(match.group('load_fall'))
+            load_upper = float(match.group('load_upper'))
+            load_max = float(match.group('load_max'))
+
+            # nodes.append((id, fanin, fanout, name, area, delay_rise,
+            #               delay_fall, slew_rise, slew_fall, load_rise,
+            #               load_fall, load_max))
+            nodes.append(Node(id, fanin, fanout, type, area, delay_upper,
+                              delay_diff, slew_upper, load_upper, load_max))
+
+            continue
+
         match = ABC_PATH_PATTERN.match(line)
         if match is not None:
             fanout = int(match.group('fanout'))
-            gate_name = match.group('gate_name')
+            name = match.group('name')
             new_cum_delay = float(match.group('delay').strip().split()[0])
 
             t_pd = new_cum_delay - cum_delay
             cum_delay = new_cum_delay
 
-            path_lines.append((gate_name, fanout, t_pd, cum_delay))
+            path_lines.append(PathLine(name, fanout, t_pd, cum_delay))
 
             continue
 
         match = ABC_POINT_PATTERN.match(line)
         if match is not None:
-            start_point = match.group('start_point').strip()
-            end_point = match.group('end_point').strip()
+            crit_start = match.group('crit_start').strip()
+            crit_end = match.group('crit_end').strip()
 
             if len(path_lines) == 0:
                 print('Missing path.')
                 sys.exit(1)
 
-            path_lines[0] = ('IN',) + path_lines[0][1:]
+            path_lines[0] = PathLine(*(('IN',) + path_lines[0][1:]))
 
             break
 
-    if start_point is None or end_point is None:
+    if crit_start is None or crit_end is None:
         print('Missing start/end point.')
         sys.exit(1)
 
-    path_lines.append(('OUT', 0, 0., cum_delay))
+    path_lines.append(PathLine('OUT', 0, 0., cum_delay))
 
     print(f"Gates: {total_cells}")
     print(f"Area: {total_gate_area:.2f} um^2")
     print(f"Critical-path delay: {delay} ps")
-
-    def print_columns(header: List[Tuple[str, ...]],
-                      rows: List[Tuple[Any, ...]]) -> None:
-        lines = header[:2]
-        fmt = header[2]
-
-        for row in rows:
-            lines.append(
-                tuple(fmt[i].format(elem) for i, elem in enumerate(row)))
-
-        widths = [0] * len(fmt)
-
-        for line in lines:
-            for i, elem in enumerate(line):
-                widths[i] = max(widths[i], len(elem))
-
-        for line in lines:
-            print(' '.join([
-                f"{elem: >{widths[i]}}" for i, elem in enumerate(line)
-            ]))
 
     def print_path(path_lines) -> None:
         print_columns([
@@ -617,7 +779,7 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
             ('Total', total_cells, float('nan'), total_gate_area)
         ])
 
-    print(f"\nCritical path: {start_point} -> {end_point}\n")
+    print(f"\nCritical path: {crit_start} -> {crit_end}\n")
     print_path(path_lines)
 
     print('\nArea breakdown:\n')
@@ -625,15 +787,201 @@ def synthesize(file: str, top: str, args: Namespace) -> None:
 
     print('\nSynthesis complete')
 
+    return Synthesis(total_cells, total_gate_area, delay, crit_start, crit_end,
+                     path_lines, cell_stats, nodes)
+
+
+VERILOG_MODULE_NAME_PATTERN = re.compile(
+    r"\s*(?P<type>\w+)\s*(?P<name>.*?\$(?P<id>\d+))\s*\(")
+
+VCD_MODULE_NAME_PATTERN = re.compile(
+    r"\s*\$scope module (?P<name>.*?) \$end")
+
+VCD_MODULE_OUTPUT_WIRE_PATTERN = re.compile(
+    r"\s*\$var wire\s+\d+ (?P<wire>.*?) Z.*? \$end")
+
+VCD_CYCLE_PATTERN = re.compile(
+    r"#(?P<cycle>\d+)")
+
+VCD_SWITCH_PATTERN = re.compile(
+    r"(?P<value>[01])(?P<wire>.*)")
+
+LIB_VDD_PATTERN = re.compile(
+    r"\s*voltage_map\s*\(VDD,(?P<v_dd>.*?)\);")
+
+START_CYCLE = 6
+
+
+def run_power(file: str, top: str, testbench: str, args: Namespace) -> None:
+    assert not args.glitch
+
+    if args.output is None:
+        power_dir = mkdtemp()
+    else:
+        power_dir = os.path.abspath(args.output)
+        os.makedirs(power_dir, exist_ok=True)
+
+    if args.verbose:
+        print(f"Power directory: {power_dir}\n")
+
+    synth_dir = os.path.join(power_dir, 'synth_dir')
+    synth_args = args
+    args.output = synth_dir
+    synthesis = run_synth(file, top, synth_args)
+    print()
+
+    # NOTE(rbd): This is preeetty hacky...
+    #
+    # yosys and abc do not share gate IDs so there is no way to link abc's
+    # calculated effective loads with yosys's generated Verilog without redoing
+    # the calculation manually (which I don't want).
+    #
+    # However, it does appear that abc writes the BLIF in the same order as the
+    # reported effective loads. Furthermore, if yosys is provided the -norename
+    # option for the write_verilog command, the Verilog gate names include
+    # monotonically increasing IDs in the order in which they were read from
+    # the BLIF output by abc.
+    #
+    # So, if both are sorted by their IDs, then they *should* line up. Good
+    # enough.
+    #
+    # (There is a tiny bit of sanity checking to at least confirm the gate
+    # types line up, but beyond that would require more recomputation that I'm
+    # trying to avoid.)
+
+    gate_loads = list(map(lambda n: (n.type, n.load_upper),
+                          sorted(synthesis.nodes, key=lambda n: n.id)))
+
+    verilog_file = os.path.join(synth_dir, 'out.v')
+    verilog_data = read_file(verilog_file)
+
+    module_instances = []  # [(id, type, name)]
+    for line in verilog_data.splitlines():
+        match = VERILOG_MODULE_NAME_PATTERN.match(line)
+        if match is not None:
+            id = int(match.group('id'))
+            type = match.group('type')
+            name = match.group('name')
+
+            module_instances.append((id, type, name))
+
+    module_names = list(map(lambda mi: mi[1:],
+                            sorted(module_instances, key=lambda mi: mi[0])))
+
+    assert len(gate_loads) == len(module_names)
+
+    module_info = {}
+    for gate_load, module_name in zip(gate_loads, module_names):
+        assert gate_load[0] == module_name[0]
+
+        module = module_name[1][1:] \
+            if module_name[1].startswith('\\') \
+            else module_name[1]
+
+        module_info[module] = Namespace(
+            name=module,
+            type=module_name[0],
+            load=gate_load[1],
+            switches=0,
+            # energy=0.,
+            avg_power=0.
+        )
+
+    sim_dir = os.path.join(power_dir, 'sim_dir')
+    sim_args = args
+    args.output = sim_dir
+    trace_file = os.path.join(power_dir, 'out.vcd')
+    args.trace = trace_file
+    run_sim(testbench, sim_args)
+    print()
+
+    trace_data = read_file(trace_file)
+
+    module = None
+    wire2module: Dict[str, str] = {}
+    cycle = -1
+    for line in trace_data.splitlines():
+        match = VCD_MODULE_NAME_PATTERN.match(line)
+        if match is not None:
+            assert module is None
+
+            name = match.group('name')
+
+            if name in module_info:
+                module = name
+
+            continue
+
+        match = VCD_MODULE_OUTPUT_WIRE_PATTERN.match(line)
+        if match is not None and module is not None:
+            wire = match.group('wire')
+
+            assert wire not in wire2module
+
+            wire2module[wire] = module
+            module = None
+
+            continue
+
+        match = VCD_CYCLE_PATTERN.match(line)
+        if match is not None:
+            cycle = int(match.group('cycle'))
+            continue
+
+        match = VCD_SWITCH_PATTERN.match(line)
+        if match is not None and cycle >= START_CYCLE:
+            value = int(match.group('value'))
+            wire = match.group('wire')
+
+            if value == 1 and wire in wire2module:
+                module_info[wire2module[wire]].switches += 1
+
+            continue
+
+    cycles = cycle - START_CYCLE + 1
+    t_clk = synthesis.delay
+
+    library_file = os.path.join(SCRIPT_DIR, f"{args.library}.lib")
+    library_data = read_file(library_file)
+
+    v_dd = None
+    for line in library_data.splitlines():
+        match = LIB_VDD_PATTERN.match(line)
+        if match is not None:
+            v_dd = float(match.group('v_dd'))
+            break
+
+    assert v_dd is not None
+
+    tot_energy = 0.
+    avg_tot_power = 0.
+    for module in module_info:
+        load = module_info[module].load
+        switches = module_info[module].switches
+
+        energy = load * switches * (v_dd ** 2)
+        avg_power = (energy / (cycles * t_clk)) * (10 ** 3)
+
+        module_info[module].avg_power = avg_power
+
+        tot_energy += energy
+        avg_tot_power += avg_power
+
+    print(f"Simulated cycles: {cycles}")
+    print(f"Supply voltage: {v_dd} V")
+    print(f"Average power: {avg_tot_power:.2f} uW")
+
 
 if __name__ == '__main__':
     args = get_args()
 
     if args.cmd == 'eval':
-        evaluate(args.files, args.expression, args)
+        run_eval(args.files, args.expression, args)
     elif args.cmd == 'sim':
-        simulate(args.file, args)
+        run_sim(args.file, args)
     elif args.cmd == 'synth':
-        synthesize(args.file, args.top, args)
+        run_synth(args.file, args.top, args)
+    elif args.cmd == 'power':
+        run_power(args.file, args.top, args.testbench, args)
     else:
         assert False, 'unreachable'
