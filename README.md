@@ -87,36 +87,44 @@ Simulate a SystemVerilog module.
     `include "FullAdder.sv"
 
     module FullAdderTest(
-      input bit clk
+      input bit clk,
+      input bit rst
     );
 
-      bit failed = 0;
-      bit [2:0] x = 3'b000;
+      bit failed;
+      bit [2:0] x;
 
       always_ff @(posedge clk) begin
-        bit [1:0] expected = {1'b0, x[2]} + {1'b0, x[1]} + {1'b0, x[0]};
-        bit [1:0] actual = full_adder(x[2], x[1], x[0]);
-
-        if (expected == actual) begin
-          $display("full_adder(%d, %d, %d) = %d",
-                   x[2], x[1], x[0], actual);
+        if (rst == 1) begin
+          failed <= 0;
+          x <= 3'b000;
         end else begin
-          $display("full_adder(%d, %d, %d) = %d (ERROR: expected %d)",
-                   x[2], x[1], x[0], actual, expected);
-          failed <= 1;
-        end
+          bit [1:0] expected = {1'b0, x[2]} + {1'b0, x[1]} + {1'b0, x[0]};
+          bit [1:0] actual = full_adder(x[2], x[1], x[0]);
 
-        if (x == 3'b111) begin
-          $display("\n%s", failed ? "FAILED" : "PASSED");
-          $finish;
-        end else begin
-          x <= x + 1;
+          if (expected == actual) begin
+            $display("full_adder(%d, %d, %d) = %d",
+                     x[2], x[1], x[0], actual);
+          end else begin
+            $display("full_adder(%d, %d, %d) = %d (ERROR: expected %d)",
+                     x[2], x[1], x[0], actual, expected);
+            failed <= 1;
+          end
+
+          if (x == 3'b111) begin
+            $display("\n%s", failed ? "FAILED" : "PASSED");
+            $finish;
+          end else begin
+            x <= x + 1;
+          end
         end
       end
 
     endmodule
     EOF
     $ hw sim FullAdderTest.sv
+    Simulating module FullAdderTest
+
     full_adder(0, 0, 0) = 0
     full_adder(0, 0, 1) = 1
     full_adder(0, 1, 0) = 1
@@ -127,6 +135,8 @@ Simulate a SystemVerilog module.
     full_adder(1, 1, 1) = 3
 
     PASSED
+
+    Simulation complete
 
 ### Synthesize
 
@@ -180,3 +190,137 @@ Synthesize a SystemVerilog function or module.
                       Total       9               nan                  8.512
 
     Synthesis complete
+
+### Power Estimation
+
+Estimate the switching power of a SystemVerilog module.
+
+**Basic command syntax**:
+
+    $ hw power <FILE> <TESTBENCH>
+
+- `<FILE>`: file containing the module for power estimation.
+- `<TESTBENCH>`: file containing testbench to stimulate the module for power
+  estimation. An include statement will be prepended for the post-synthesis
+  Verilog of `<FILE>` and any existing include statements for `<FILE>` will be
+  removed.
+
+**Example**:
+
+    $ cat >FullAdder.sv <<'EOF'
+    function bit [1:0] full_adder(bit a, bit b, bit cin);
+      return {
+        a & b | a & cin | b & cin,
+        a ^ b ^ cin
+      };
+    endfunction
+
+    module FullAdder(
+      input bit clk,
+      input bit a,
+      input bit b,
+      input bit cin,
+      output bit [1:0] ret
+    );
+
+      assign ret = full_adder(a, b, cin);
+
+    endmodule
+    EOF
+    $ cat >FullAdderTest.sv <<'EOF'
+    `include "FullAdder.sv"
+
+    module FullAdderTest(
+      input bit clk,
+      input bit rst
+    );
+
+      bit failed;
+      bit [2:0] x;
+
+      bit [1:0] actual;
+
+      FullAdder full_adder(
+        .clk(clk),
+        .a(x[2]),
+        .b(x[1]),
+        .cin(x[0]),
+        .ret(actual)
+      );
+
+      always_ff @(posedge clk) begin
+        if (rst == 1) begin
+          failed <= 0;
+          x <= 3'b000;
+        end else begin
+          bit [1:0] expected = {1'b0, x[2]} + {1'b0, x[1]} + {1'b0, x[0]};
+
+          if (expected == actual) begin
+            $display("full_adder(%d, %d, %d) = %d",
+                     x[2], x[1], x[0], actual);
+          end else begin
+            $display("full_adder(%d, %d, %d) = %d (ERROR: expected %d)",
+                     x[2], x[1], x[0], actual, expected);
+            failed <= 1;
+          end
+
+          if (x == 3'b111) begin
+            $display("\n%s", failed ? "FAILED" : "PASSED");
+            $finish;
+          end else begin
+            x <= x + 1;
+          end
+        end
+      end
+
+    endmodule
+    EOF
+    $ hw power FullAdder.sv FullAdderTest.sv
+    Synthesizing module FullAdder with library = multisize, O1, target delay = 1 ps
+
+    Gates: 9
+    Area: 8.51 um^2
+    Critical-path delay: 48.4 ps
+
+    Critical path: \b -> \ret [0]
+
+                  Gate/port  Fanout   Gate delay (ps)  Cumulative delay (ps)
+                  ---------  ------   ---------------  ---------------------
+                         IN       3               8.4                    8.4
+                     OR2_X2       2              23.6                   32.0
+                   NAND3_X1       1               8.5                   40.5
+                   NAND2_X1       1               7.9                   48.4
+                        OUT       0               0.0                   48.4
+
+    Area breakdown:
+
+                  Gate type   Gates  Area/gate (um^2)       Area/type (um^2)
+                  ---------   -----  ----------------       ----------------
+                     INV_X1       1             0.532                  0.532
+                   NAND2_X1       5             0.798                  3.990
+                   NAND3_X1       1             1.064                  1.064
+                     OR2_X2       1             1.330                  1.330
+                   XNOR2_X1       1             1.596                  1.596
+                      Total       9               nan                  8.512
+
+    Synthesis complete
+
+    Simulating module FullAdderTest
+
+    full_adder(0, 0, 0) = 0
+    full_adder(0, 0, 1) = 1
+    full_adder(0, 1, 0) = 1
+    full_adder(0, 1, 1) = 2
+    full_adder(1, 0, 0) = 1
+    full_adder(1, 0, 1) = 2
+    full_adder(1, 1, 0) = 2
+    full_adder(1, 1, 1) = 3
+
+    PASSED
+
+    Simulation complete
+
+    Simulated cycles: 8
+    Supply voltage: 1.25 V
+    Average power: 93.22 uW
+

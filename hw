@@ -127,10 +127,6 @@ def get_args() -> Namespace:
         type=str,
         help='File with module to estimate power.')
     power_parser.add_argument(
-        'top',
-        type=str,
-        help='Name of top-level function or module to estimate power.')
-    power_parser.add_argument(
         'testbench',
         type=str,
         help='File with testbench for simulation.')
@@ -263,6 +259,7 @@ VERILATOR_TEMPLATE = string.Template(
     'verilator --cc --exe --build $SIM_FILE $FILE --Mdir $BUILD_DIR ' +
     '--relative-includes -CFLAGS -DVL_NO_LEGACY --top-module $MODULE')
 
+START_PATTERN = re.compile(r"### CYCLE 0 ###")
 FINISH_PATTERN = re.compile(r"- [^:]+:\d+: Verilog \$finish")
 
 
@@ -331,12 +328,22 @@ def run_sim(file: str, args: Namespace, func: bool = False) -> str:
 
     bin_file = os.path.join(build_dir, f"V{module} +verilator+rand+reset+2")
     stdout = run(bin_file)
+    started = False
     for line in stdout.splitlines():
+        if START_PATTERN.match(line) is not None:
+            started = True
+            continue
+
         if FINISH_PATTERN.match(line) is not None:
             continue
-        print(line)
 
-    print('\nSimulation complete')
+        if started:
+            print(line)
+
+    assert started
+
+    if not func:
+        print('\nSimulation complete')
 
     return stdout
 
@@ -791,6 +798,9 @@ def run_synth(file: str, top: str, args: Namespace) -> Synthesis:
                      path_lines, cell_stats, nodes)
 
 
+VERILOG_INCLUDE_PATTERN_TEMPLATE = string.Template(
+    r"\s*`include\s*\"$FILE\"\s*")
+
 VERILOG_MODULE_NAME_PATTERN = re.compile(
     r"\s*(?P<type>\w+)\s*(?P<name>.*?\$(?P<id>\d+))\s*\(")
 
@@ -800,8 +810,8 @@ VCD_MODULE_NAME_PATTERN = re.compile(
 VCD_MODULE_OUTPUT_WIRE_PATTERN = re.compile(
     r"\s*\$var wire\s+\d+ (?P<wire>.*?) Z.*? \$end")
 
-VCD_CYCLE_PATTERN = re.compile(
-    r"#(?P<cycle>\d+)")
+VCD_TIME_PATTERN = re.compile(
+    r"#(?P<time>\d+)")
 
 VCD_SWITCH_PATTERN = re.compile(
     r"(?P<value>[01])(?P<wire>.*)")
@@ -809,10 +819,10 @@ VCD_SWITCH_PATTERN = re.compile(
 LIB_VDD_PATTERN = re.compile(
     r"\s*voltage_map\s*\(VDD,(?P<v_dd>.*?)\);")
 
-START_CYCLE = 6
+START_TIME = 6
 
 
-def run_power(file: str, top: str, testbench: str, args: Namespace) -> None:
+def run_power(file: str, testbench: str, args: Namespace) -> None:
     assert not args.glitch
 
     if args.output is None:
@@ -827,6 +837,7 @@ def run_power(file: str, top: str, testbench: str, args: Namespace) -> None:
     synth_dir = os.path.join(power_dir, 'synth_dir')
     synth_args = args
     args.output = synth_dir
+    top = Path(file).stem
     synthesis = run_synth(file, top, synth_args)
     print()
 
@@ -887,19 +898,37 @@ def run_power(file: str, top: str, testbench: str, args: Namespace) -> None:
             avg_power=0.
         )
 
+    verilog_include_pattern = re.compile(
+        VERILOG_INCLUDE_PATTERN_TEMPLATE.substitute(
+            FILE=file
+        )
+    )
+
+    testbench_data = read_file(testbench)
+    testbench = Path(testbench).stem
+    post_synth_file = os.path.join(synth_dir, 'out.v')
+    testbench_lines = testbench_data.splitlines()
+    testbench_lines = \
+        [f'`include "{post_synth_file}"'] + \
+        [line for line in testbench_lines
+         if verilog_include_pattern.match(line) is None]
+    testbench_data = '\n'.join(testbench_lines)
+    testbench_file = os.path.join(power_dir, f"{testbench}.sv")
+    write_file(testbench_file, testbench_data)
+
     sim_dir = os.path.join(power_dir, 'sim_dir')
     sim_args = args
     args.output = sim_dir
     trace_file = os.path.join(power_dir, 'out.vcd')
     args.trace = trace_file
-    run_sim(testbench, sim_args)
+    run_sim(testbench_file, sim_args)
     print()
 
     trace_data = read_file(trace_file)
 
     module = None
     wire2module: Dict[str, str] = {}
-    cycle = -1
+    time = -1
     for line in trace_data.splitlines():
         match = VCD_MODULE_NAME_PATTERN.match(line)
         if match is not None:
@@ -923,13 +952,13 @@ def run_power(file: str, top: str, testbench: str, args: Namespace) -> None:
 
             continue
 
-        match = VCD_CYCLE_PATTERN.match(line)
+        match = VCD_TIME_PATTERN.match(line)
         if match is not None:
-            cycle = int(match.group('cycle'))
+            time = int(match.group('time'))
             continue
 
         match = VCD_SWITCH_PATTERN.match(line)
-        if match is not None and cycle >= START_CYCLE:
+        if match is not None and time >= START_TIME:
             value = int(match.group('value'))
             wire = match.group('wire')
 
@@ -938,7 +967,9 @@ def run_power(file: str, top: str, testbench: str, args: Namespace) -> None:
 
             continue
 
-    cycles = cycle - START_CYCLE + 1
+    cycles = time - START_TIME + 1
+    assert cycles % 2 == 0
+    cycles //= 2
     t_clk = synthesis.delay
 
     library_file = os.path.join(SCRIPT_DIR, f"{args.library}.lib")
@@ -982,6 +1013,6 @@ if __name__ == '__main__':
     elif args.cmd == 'synth':
         run_synth(args.file, args.top, args)
     elif args.cmd == 'power':
-        run_power(args.file, args.top, args.testbench, args)
+        run_power(args.file, args.testbench, args)
     else:
         assert False, 'unreachable'
