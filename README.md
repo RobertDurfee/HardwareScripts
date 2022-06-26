@@ -1,8 +1,9 @@
 # HardwareScripts
 
-Provides the `hw` script for quick-and-dirty evaluating, simulating, and
-synthesizing of SystemVerilog snippets. This script borrows code from the `ms`
-script for [Minispec](https://github.com/minispec-hdl/minispec).
+Provides the `hw` script for quick-and-dirty evaluating, simulating,
+synthesizing, and power estimation of SystemVerilog snippets. This script
+borrows code from the `ms` script for
+[Minispec](https://github.com/minispec-hdl/minispec).
 
 ## Setup
 
